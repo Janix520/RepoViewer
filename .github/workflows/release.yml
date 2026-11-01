@@ -1,0 +1,340 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (numeric, e.g. 1.0.0)"
+        required: true
+        default: "1.0.0"
+      runtime:
+        description: "JRE packaging: minimal (jdeps) or full"
+        type: choice
+        options:
+          - minimal
+          - full
+        default: minimal
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  # ===========================================================
+  #  Normalize the version and tag used by all later jobs
+  # ===========================================================
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.info.outputs.version }}
+      tag: ${{ steps.info.outputs.tag }}
+    steps:
+      - name: Resolve version
+        id: info
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          # jpackage --app-version: 2-4 numeric components (major.minor[.build[.revision]])
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+){0,2}$'; then
+            echo "::error::Invalid version '$VERSION'. Use a version such as 1.0.0."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+  # ===========================================================
+  #  Build the shaded jar (no JRE) once, on Linux
+  # ===========================================================
+  build:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build and test
+        run: mvn -B -ntp clean package
+
+      - name: Stage jar
+        run: cp target/RepoViewer.jar "RepoViewer-${{ needs.version.outputs.version }}.jar"
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: jar
+          path: RepoViewer-*.jar
+          if-no-files-found: error
+
+  # ===========================================================
+  #  Platform installers with a bundled JRE (jpackage)
+  # ===========================================================
+  package:
+    needs: [version, build]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            type: app-image
+            label: windows
+            ext: zip
+          - os: windows-latest
+            type: exe
+            label: windows-installer
+            ext: exe
+          - os: ubuntu-latest
+            type: deb
+            label: linux-deb
+            ext: deb
+          - os: ubuntu-latest
+            type: rpm
+            label: linux-rpm
+            ext: rpm
+          - os: macos-latest
+            type: dmg
+            label: macos-arm64
+            ext: dmg
+          - os: macos-15-intel
+            type: dmg
+            label: macos-x64
+            ext: dmg
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout (application icons)
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (jpackage)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download jar
+        uses: actions/download-artifact@v4
+        with:
+          name: jar
+          path: staging
+
+      # Linux: deb needs fakeroot, rpm needs rpmbuild
+      - name: Install Linux packaging tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot rpm dpkg-dev
+
+      # Windows installer (--type exe) needs WiX Toolset 3.x; app-image does not.
+      - name: Install WiX Toolset 3 (installer only)
+        if: matrix.type == 'exe'
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\WiX Toolset v3.14",
+            "${env:ProgramFiles(x86)}\WiX Toolset v3.11",
+            "$env:ProgramFiles\WiX Toolset v3.14"
+          )
+          $wix = $candidates | Where-Object { Test-Path (Join-Path $_ 'bin\candle.exe') } | Select-Object -First 1
+          if (-not $wix) {
+            choco install wixtoolset --version=3.14.1 -y --no-progress
+            $wix = $candidates | Where-Object { Test-Path (Join-Path $_ 'bin\candle.exe') } | Select-Object -First 1
+          }
+          if (-not $wix) {
+            # Chocolatey may install a slightly different 3.x directory name
+            $wix = Get-ChildItem "${env:ProgramFiles(x86)}" -Directory -Filter "WiX Toolset v3*" -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $wix -or -not (Test-Path (Join-Path $wix 'bin\candle.exe'))) {
+            throw "WiX Toolset 3.x (candle.exe) was not found. jpackage cannot build the .exe installer."
+          }
+          Join-Path $wix "bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Resolve runtime modules
+        id: runtime-modules
+        shell: bash
+        env:
+          RUNTIME_MODE: ${{ inputs.runtime || 'minimal' }}
+          # jdeps cannot see these: charset lookup (GB18030) and TLS providers.
+          # Add jdk.localedata only if you need localized date/number formatting.
+          EXTRA_MODULES: "jdk.charsets,jdk.crypto.ec"
+        run: |
+          set -euo pipefail
+          JAR=$(find staging -maxdepth 1 -type f -name '*.jar' | head -n 1)
+          if [ -z "$JAR" ]; then
+            echo "::error::No jar found in staging"
+            exit 1
+          fi
+
+          if [ "$RUNTIME_MODE" = "full" ]; then
+            # Broad runtime: all Java SE modules plus common JDK modules.
+            MODULES="java.se,jdk.unsupported,jdk.crypto.ec,jdk.charsets,jdk.localedata,jdk.zipfs,jdk.incubator.vector"
+          else
+            # Minimal runtime: only what the shaded jar actually references.
+            MODULES=$(jdeps --multi-release 21 --ignore-missing-deps --print-module-deps "$JAR")
+            MODULES="$MODULES${EXTRA_MODULES:+,$EXTRA_MODULES}"
+          fi
+
+          MODULES=$(printf '%s' "$MODULES" | tr ',' '\n' | awk 'NF && !seen[$0]++ {printf "%s%s", (n++ ? "," : ""), $0}')
+          echo "modules=$MODULES" >> "$GITHUB_OUTPUT"
+          echo "Runtime modules ($RUNTIME_MODE): $MODULES"
+
+      - name: Build package with jpackage
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TYPE: ${{ matrix.type }}
+          VENDOR: RepoViewer
+          DESCRIPTION: "Browse local repositories and search Markdown/code"
+          COPYRIGHT: "Copyright 2026 RepoViewer"
+        run: |
+          set -euo pipefail
+
+          JAR=$(find staging -maxdepth 1 -type f -name '*.jar' | head -n 1)
+          if [ -z "$JAR" ]; then
+            echo "::error::No jar found in staging"
+            exit 1
+          fi
+          JAR_NAME=$(basename "$JAR")
+
+          # Per-platform installer options. Keep the deb maintainer address
+          # as a placeholder and change it if you publish under your own name.
+          EXTRA=()
+          ICON=""
+          case "$TYPE" in
+            app-image)
+              # Portable Windows build: unzip and run RepoViewer.exe.
+              # Installer-only options (--win-menu, --win-shortcut, ...) are invalid here.
+              ICON="src/main/resources/icon/icon.ico"
+              ;;
+            exe)
+              ICON="src/main/resources/icon/icon.ico"
+              EXTRA+=(--win-menu --win-shortcut --win-dir-chooser --win-per-user-install)
+              ;;
+            deb)
+              ICON="src/main/resources/icon/icon.png"
+              EXTRA+=(--linux-shortcut --linux-menu-group Utility
+                      --linux-deb-maintainer "repoviewer@example.com")
+              ;;
+            rpm)
+              ICON="src/main/resources/icon/icon.png"
+              EXTRA+=(--linux-shortcut --linux-menu-group Utility)
+              ;;
+            dmg)
+              ICON="src/main/resources/icon/icon.icns"
+              EXTRA+=(--mac-package-identifier com.repoviewer.app --mac-package-name RepoViewer)
+              ;;
+          esac
+          if [ ! -f "$ICON" ]; then
+            echo "::error::Application icon not found: $ICON"
+            exit 1
+          fi
+
+          mkdir -p dist
+          jpackage \
+            --type "$TYPE" \
+            --name RepoViewer \
+            --app-version "$VERSION" \
+            --vendor "$VENDOR" \
+            --description "$DESCRIPTION" \
+            --copyright "$COPYRIGHT" \
+            --icon "$ICON" \
+            --input staging \
+            --main-jar "$JAR_NAME" \
+            --main-class com.repoviewer.RepoViewerApp \
+            --add-modules "${{ steps.runtime-modules.outputs.modules }}" \
+            --java-options "-Dfile.encoding=UTF-8" \
+            --dest dist \
+            "${EXTRA[@]}"
+
+          ARCH=$(uname -m)
+          if [[ "${{ matrix.label }}" == macos-* ]]; then
+            # The macOS label already carries the architecture
+            NAME="RepoViewer-${VERSION}-${{ matrix.label }}"
+          else
+            NAME="RepoViewer-${VERSION}-${{ matrix.label }}-${ARCH}"
+          fi
+
+          if [[ "$TYPE" == "app-image" ]]; then
+            # jpackage app-image produces dist/RepoViewer/ (RepoViewer.exe + runtime).
+            OUT="${NAME}.zip"
+            if command -v 7z >/dev/null 2>&1; then
+              (cd dist && 7z a -tzip "../$OUT" RepoViewer >/dev/null)
+            else
+              powershell.exe -NoProfile -Command \
+                "Compress-Archive -Path 'dist/RepoViewer' -DestinationPath '$OUT' -Force"
+            fi
+          else
+            FILE=$(find dist -maxdepth 1 -type f | head -n 1)
+            if [ -z "$FILE" ]; then
+              echo "::error::jpackage produced no installer"
+              exit 1
+            fi
+            OUT="${NAME}.${FILE##*.}"
+            cp "$FILE" "$OUT"
+          fi
+          echo "Built $OUT"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.label }}
+          path: RepoViewer-*.${{ matrix.ext }}
+          if-no-files-found: error
+
+  # ===========================================================
+  #  Publish everything to GitHub Releases
+  # ===========================================================
+  release:
+    needs: [version, build, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: RepoViewer ${{ needs.version.outputs.tag }}
+          draft: false
+          make_latest: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # Re-running a release replaces assets with the same names
+          overwrite_files: true
+          body: |
+            ## Downloads
+
+            | Platform | File | Notes |
+            | --- | --- | --- |
+            | Any | `RepoViewer-*.jar` | Requires Java 21+; no JRE bundled |
+            | Windows (portable) | `RepoViewer-*-windows-*.zip` | jpackage app-image with bundled JRE; unzip and run `RepoViewer.exe` |
+            | Windows (installer) | `RepoViewer-*-windows-installer-*.exe` | Installer with bundled JRE |
+            | Linux Debian/Ubuntu | `RepoViewer-*-linux-deb-*.deb` | Package with bundled JRE |
+            | Linux Fedora/RHEL | `RepoViewer-*-linux-rpm-*.rpm` | Package with bundled JRE |
+            | macOS | `RepoViewer-*-macos-*.dmg` | Bundled JRE; unsigned, right-click → Open on first launch |
+
+            The macOS build is not notarized. If Gatekeeper blocks it, open it with
+            **Right-click → Open** or allow it in **System Settings → Privacy & Security**.
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
